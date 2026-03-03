@@ -26,6 +26,38 @@ def _map_lifecycle_to_status(lifecycle: str | None) -> str | None:
     return lifecycle_map.get(lifecycle.lower())
 
 
+def _connect_bamboo(
+    provider: str,
+    db: Session,
+):
+    api_key = settings.BAMBOO_API_KEY
+    subdomain = settings.BAMBOO_SUBDOMAIN
+
+    if not api_key or not subdomain:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "BAMBOO_API_KEY and BAMBOO_SUBDOMAIN are required for bamboo"},
+        )
+
+    connection = HRMSConnection(
+        user_id=0,
+        provider=provider,
+        access_token=api_key,
+        refresh_token=subdomain,
+        token_expiry=datetime.now(timezone.utc) + timedelta(days=3650),
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(connection)
+    db.commit()
+
+    return {
+        "provider": provider,
+        "message": "bamboo connected successfully",
+        "subdomain": subdomain,
+    }
+
+
 @router.get("/auth/")
 def hrms_auth_init(
     provider: str | None = Query(default=None),
@@ -33,10 +65,14 @@ def hrms_auth_init(
 ):
     if not provider:
         return JSONResponse(status_code=400, content={"error": "Provider required"})
+    provider_name = provider.strip().lower()
+
+    if provider_name == "bamboo":
+        return _connect_bamboo(provider_name, db)
 
     connection = HRMSConnection(
         user_id=0,
-        provider=provider,
+        provider=provider_name,
         access_token="",
         refresh_token=None,
         token_expiry=datetime.now(timezone.utc),
@@ -47,12 +83,11 @@ def hrms_auth_init(
     db.commit()
     db.refresh(connection)
 
-    connector = get_hrms_connector(provider, connection, db, settings)
-    state = f"{provider}:{connection.id}"
+    connector = get_hrms_connector(provider_name, connection, db, settings)
+    state = f"{provider_name}:{connection.id}"
     auth_url = connector.get_authorization_url(state)
 
     return {"auth_url": auth_url}
-
 
 @router.get("/callback/")
 def hrms_oauth_callback(
@@ -67,6 +102,7 @@ def hrms_oauth_callback(
         provider, connection_id = state.split(":", 1)
     except ValueError:
         return JSONResponse(status_code=400, content={"error": "Invalid callback"})
+    provider_name = provider.strip().lower()
 
     try:
         connection_id_value = int(connection_id)
@@ -77,7 +113,7 @@ def hrms_oauth_callback(
         db.query(HRMSConnection)
         .filter(
             HRMSConnection.id == connection_id_value,
-            HRMSConnection.provider == provider,
+            HRMSConnection.provider == provider_name,
         )
         .first()
     )
@@ -85,7 +121,13 @@ def hrms_oauth_callback(
     if not connection:
         return JSONResponse(status_code=400, content={"error": "Connection not found"})
 
-    connector = get_hrms_connector(provider, connection, db, settings)
+    if provider_name == "bamboo":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Bamboo does not use OAuth callback"},
+        )
+
+    connector = get_hrms_connector(provider_name, connection, db, settings)
     token_data = connector.exchange_code_for_token(code)
 
     connection.access_token = token_data["access_token"]
@@ -97,7 +139,7 @@ def hrms_oauth_callback(
     db.commit()
 
     return {
-        "provider": provider,
+        "provider": provider_name,
         "access_token": connection.access_token,
         "refresh_token": connection.refresh_token,
         "token_expiry": connection.token_expiry.isoformat(),
@@ -113,11 +155,12 @@ def hrms_employees(
 ):
     if not provider:
         return JSONResponse(status_code=400, content={"error": "Provider required"})
+    provider_name = provider.strip().lower()
 
     connection = (
         db.query(HRMSConnection)
         .filter(
-            HRMSConnection.provider == provider,
+            HRMSConnection.provider == provider_name,
             HRMSConnection.is_active.is_(True),
         )
         .order_by(desc(HRMSConnection.id))
@@ -127,10 +170,10 @@ def hrms_employees(
     if not connection:
         return JSONResponse(
             status_code=400,
-            content={"error": f"{provider} not connected"},
+            content={"error": f"{provider_name} not connected"},
         )
 
-    connector = get_hrms_connector(provider, connection, db, settings)
+    connector = get_hrms_connector(provider_name, connection, db, settings)
 
     if lifecycle:
         status = _map_lifecycle_to_status(lifecycle)
