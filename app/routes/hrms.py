@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
@@ -26,6 +26,7 @@ def _map_lifecycle_to_status(lifecycle: str | None) -> str | None:
     return lifecycle_map.get(lifecycle.lower())
 
 
+# ===== ZOHO OAUTH FLOW (UNCHANGED) =====
 @router.get("/auth/")
 def hrms_auth_init(
     provider: str | None = Query(default=None),
@@ -33,6 +34,13 @@ def hrms_auth_init(
 ):
     if not provider:
         return JSONResponse(status_code=400, content={"error": "Provider required"})
+
+    # Skip OAuth init for API Key providers
+    if provider.lower() == "bamboohr":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "BambooHR uses API Key auth. Use /api/hrms/connect/ instead"},
+        )
 
     connection = HRMSConnection(
         user_id=0,
@@ -60,6 +68,7 @@ def hrms_oauth_callback(
     state: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
+    # ...existing code...
     if not code or not state:
         return JSONResponse(status_code=400, content={"error": "Invalid callback"})
 
@@ -104,6 +113,63 @@ def hrms_oauth_callback(
     }
 
 
+# ===== NEW: BAMBOOHR API KEY CONNECTION =====
+@router.post("/connect/")
+def hrms_api_key_connect(
+    provider: str | None = Query(default=None),
+    api_key: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Direct API Key authentication for providers like BambooHR
+    No OAuth flow needed
+    """
+    if not provider or not api_key:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Provider and API Key required"},
+        )
+
+    # Validate API key with the provider
+    connector = get_hrms_connector(provider, None, db, settings)
+    
+    try:
+        # Test connection with provided API key
+        is_valid = connector.validate_api_key(api_key)
+        if not is_valid:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid API Key"},
+            )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Validation failed: {str(exc)}"},
+        )
+
+    # Create connection record (no refresh token needed for API key)
+    connection = HRMSConnection(
+        user_id=0,
+        provider=provider,
+        access_token=api_key,  # Store API key as access_token
+        refresh_token=None,     # No refresh token for API key auth
+        token_expiry=None,      # No expiry for API keys (unless set by provider)
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(connection)
+    db.commit()
+    db.refresh(connection)
+
+    return {
+        "provider": provider,
+        "connection_id": connection.id,
+        "status": "Connected successfully",
+        "message": "API Key stored securely",
+    }
+
+
+# ===== EMPLOYEE FETCH (MODIFIED) =====
 @router.get("/employees/")
 def hrms_employees(
     provider: str | None = Query(default=None),
@@ -130,6 +196,14 @@ def hrms_employees(
             content={"error": f"{provider} not connected"},
         )
 
+    # Check if token/key is expired (OAuth only)
+    if provider.lower() != "bamboohr" and connection.token_expiry:
+        if datetime.now(timezone.utc) > connection.token_expiry:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Token expired. Please reconnect."},
+            )
+
     connector = get_hrms_connector(provider, connection, db, settings)
 
     if lifecycle:
@@ -148,3 +222,5 @@ def hrms_employees(
         return employees
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
+    
+    
